@@ -1,0 +1,13 @@
+{
+  "name": "git-pilot",
+  "owner": {
+    "name": "saimumsh"
+  },
+  "plugins": [
+    {
+      "name": "gitpilot",
+      "source": "./",
+      "description": "Safe Git helpers: Conventional Commit messages, safe undo, and a guard that blocks secret commits and destructive git commands"
+    }
+  ]
+}
