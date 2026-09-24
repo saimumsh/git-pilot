@@ -43,6 +43,11 @@ Current repository context (JSON from `gitpilot context`):
    - Only describe what is visible in the diff. Follow any hint in the arguments.
 6. Unless the arguments contain `--yes`, show the message and ask the user to
    approve or request changes. Wait for their answer.
+   If the last line of `stat` shows more than 10 files or more than 300
+   changed lines, add one line to that question: "This is a large change —
+   run `/code-review` before committing?" If they want a review, stop here;
+   their changes stay staged. (`/gitpilot:review` reviews committed branch
+   work before merging; `/code-review` covers staged changes.)
 7. If `protected_branch` is true, tell the user they are committing directly
    to `branch` and ask whether that is intended. Only add `--allow-protected`
    if they explicitly agree.

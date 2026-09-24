@@ -4,6 +4,10 @@ gitpilot - AI commit messages with safety checks.
 
 Used by the Claude Code plugin (no API key needed, Claude writes the text):
   gitpilot context             Print staged-change info as JSON, no AI call
+  gitpilot review [base]       Print branch-vs-base info as JSON for a review
+  gitpilot pr-comment          Post a review (JSON on stdin) to the branch's PR
+  gitpilot pr-merge [--stdin]  Check the PR can merge; with --stdin, merge it
+  gitpilot conflicts [--finish]  List conflicts as JSON; --finish stages, continues
   gitpilot commit --stdin      Commit with a message given on stdin, after checks
   gitpilot undo                Undo the last commit, keep changes staged, save a backup
   gitpilot guard               PreToolUse hook: blocks secret commits, force pushes
@@ -129,9 +133,14 @@ def is_noise(path: str) -> bool:
 
 # ------------------------------------------------------------ safety layer
 def find_secrets(diff_args: tuple[str, ...] = ("--staged",)) -> list[str]:
-    """Scan only ADDED lines of a diff (staged changes by default)."""
+    """Scan a git diff (staged changes by default)."""
+    return scan_diff(git("diff", *diff_args, "-U0", "--no-color"))
+
+
+def scan_diff(diff: str) -> list[str]:
+    """Scan only ADDED lines of a unified diff."""
     found, current = [], "?"
-    for line in git("diff", *diff_args, "-U0", "--no-color").splitlines():
+    for line in diff.splitlines():
         if line.startswith("+++ "):
             current = line[6:] if line.startswith("+++ b/") else line[4:]
         elif line.startswith("+") and not line.startswith("+++"):
@@ -157,10 +166,11 @@ def find_secrets_untracked(limit: int = 200) -> list[str]:
     return found
 
 
-def large_files(files: list[str]) -> list[str]:
+def large_files(files: list[str], rev: str = "") -> list[str]:
+    """rev "" = the staged version, "HEAD" = the committed version."""
     result = []
     for f in files:
-        size = git("cat-file", "-s", f":{f}", check=False).strip()
+        size = git("cat-file", "-s", f"{rev}:{f}", check=False).strip()
         if size.isdigit() and int(size) > LARGE_FILE_BYTES:
             result.append(f"{f} ({int(size) / 1024 / 1024:.1f} MB)")
     return result
@@ -554,6 +564,252 @@ def cmd_context(args) -> int:
     return 0
 
 
+def default_base() -> str:
+    """The branch a PR would merge into: origin's default, else main/master."""
+    ref = git("symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD",
+              check=False).strip()
+    if ref:
+        return ref
+    return next((b for b in ("main", "master")
+                 if git_ok("rev-parse", "--verify", "-q", b)), "main")
+
+
+def cmd_review(args) -> int:
+    """Everything needed to review a branch before merging, gathered by plain code."""
+    base = args.base or default_base()
+    if not git_ok("rev-parse", "--verify", "-q", base):
+        error(f"Unknown base branch '{base}'.")
+        return 1
+    rng = f"{base}...HEAD"  # only what this branch added since it split off
+    files = [f for f in git("diff", "--name-only", "-z", rng).split("\0") if f]
+    ctx = {
+        "base": base,
+        "branch": current_branch(),
+        "range": rng,
+        "commits": git("log", "--format=%h %s", f"{base}..HEAD").splitlines(),
+        "files": files,
+        "skip_files": [f for f in files if is_noise(f)],
+        "stat": git("diff", "--stat", "--no-color", rng),
+        "secrets_found": find_secrets((rng,)),
+        "large_files": large_files(files, "HEAD"),
+        "uncommitted_changes": bool(git("status", "--porcelain").strip()),
+    }
+    print(json.dumps(ctx, indent=2, ensure_ascii=False))
+    return 0
+
+
+def gh(*args: str, input_text: str | None = None) -> str:
+    try:
+        r = subprocess.run(["gh", *args], capture_output=True, text=True,
+                           input=input_text)
+    except FileNotFoundError:
+        raise GitError("The GitHub CLI is missing: https://cli.github.com, "
+                       "then run `gh auth login`")
+    if r.returncode != 0:
+        raise GitError(r.stderr.strip() or f"gh {args[0]} failed")
+    return r.stdout
+
+
+def diff_lines(diff: str) -> dict[str, set[int]]:
+    """New-side line numbers GitHub accepts inline comments on, per file."""
+    lines, path = {}, None
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            path = line[6:] if line.startswith("+++ b/") else None
+        elif path and (m := re.match(r"@@ -\S+ \+(\d+)(?:,(\d+))? @@", line)):
+            start, count = int(m[1]), int(m[2] or 1)
+            lines.setdefault(path, set()).update(range(start, start + count))
+    return lines
+
+
+def cmd_pr_comment(args) -> int:
+    """Post a review (JSON on stdin) to this branch's PR as inline comments."""
+    try:
+        review = json.loads(sys.stdin.read())
+        comments = [{"path": c["path"], "line": int(c["line"]), "body": c["body"]}
+                    for c in review.get("comments", [])]
+        body = review.get("body", "").strip()
+    except (ValueError, AttributeError, KeyError, TypeError):
+        error('stdin must be JSON: {"body": "...", "comments": '
+              '[{"path": "...", "line": 1, "body": "..."}]}')
+        return 1
+    pr = json.loads(gh("pr", "view", *([args.pr] if args.pr else []),
+                       "--json", "number,url,headRefOid"))
+    head = git("rev-parse", "HEAD").strip()
+    if pr["headRefOid"] != head:
+        error(f"PR #{pr['number']} is not at your local commit. Push (or pull) "
+              "first, so the line numbers match what GitHub shows.")
+        return 1
+    allowed = diff_lines(gh("pr", "diff", str(pr["number"])))
+    inline, outside = [], []
+    for c in comments:
+        if c["line"] in allowed.get(c["path"], ()):
+            inline.append({"path": c["path"], "line": c["line"],
+                           "side": "RIGHT", "body": c["body"]})
+        else:  # GitHub rejects the whole review if one line is not in the diff
+            outside.append(f"- `{c['path']}:{c['line']}` {c['body']}")
+    if outside:
+        body += "\n\n**Outside the diff:**\n" + "\n".join(outside)
+    payload = {"commit_id": head, "event": "COMMENT", "body": body,
+               "comments": inline}
+    if args.dry_run:
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+        return 0
+    gh("api", "--method", "POST",
+       f"repos/{{owner}}/{{repo}}/pulls/{pr['number']}/reviews",
+       "--input", "-", input_text=json.dumps(payload))
+    ok(f"Posted {len(inline)} inline comment(s) to {pr['url']}")
+    return 0
+
+
+PR_FIELDS = ("number,url,title,state,isDraft,mergeable,mergeStateStatus,"
+             "baseRefName,headRefName,headRefOid,statusCheckRollup,reviewDecision")
+FAILED = {"FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED",
+          "STARTUP_FAILURE"}
+
+
+def merge_problems(pr: dict) -> tuple[list[str], list[str]]:
+    """(blocking problems, warnings) for merging a PR, from `gh pr view` JSON."""
+    base = pr["baseRefName"]
+    problems, warnings = [], []
+    if pr["state"] != "OPEN":
+        problems.append(f"the PR is {pr['state'].lower()}")
+    if pr["isDraft"]:
+        problems.append("the PR is still a draft")
+    if pr["mergeable"] == "CONFLICTING":
+        problems.append(f"it has conflicts with {base}")
+    elif pr["mergeable"] == "UNKNOWN":
+        problems.append("GitHub is still checking for conflicts; try again shortly")
+    if pr.get("reviewDecision") == "CHANGES_REQUESTED":
+        problems.append("a reviewer requested changes")
+    failing, pending = [], []
+    for c in pr.get("statusCheckRollup") or []:
+        name = c.get("name") or c.get("context") or "check"
+        result = c.get("conclusion") or c.get("state") or ""
+        if result in FAILED:
+            failing.append(name)
+        elif c.get("status", "COMPLETED") != "COMPLETED" or result in ("PENDING", "EXPECTED"):
+            pending.append(name)
+    if failing:
+        problems.append("failing checks: " + ", ".join(failing))
+    if pending:
+        problems.append("checks still running: " + ", ".join(pending))
+    if pr["mergeStateStatus"] == "BLOCKED" and not problems:
+        problems.append(f"{base} is protected and a required review or check is missing")
+    if pr["mergeStateStatus"] == "BEHIND":
+        warnings.append(f"the branch is behind {base}")
+    return problems, warnings
+
+
+def cmd_pr_merge(args) -> int:
+    """Without --stdin: print whether the PR can merge. With it: merge, after
+    the same checks, using the subject line given on stdin."""
+    pr = json.loads(gh("pr", "view", *([args.pr] if args.pr else []),
+                       "--json", PR_FIELDS))
+    problems, warnings = merge_problems(pr)
+    if secrets := scan_diff(gh("pr", "diff", str(pr["number"]))):
+        problems.append("possible secrets: " + "; ".join(secrets))
+    if current_branch() == pr["headRefName"] and \
+            git("rev-parse", "HEAD").strip() != pr["headRefOid"]:
+        warnings.append("your local branch differs from the PR; "
+                        "unpushed commits will not be merged")
+    if not args.stdin:
+        print(json.dumps({"number": pr["number"], "url": pr["url"],
+                          "title": pr["title"], "base": pr["baseRefName"],
+                          "branch": pr["headRefName"], "problems": problems,
+                          "warnings": warnings}, indent=2, ensure_ascii=False))
+        return 0
+    if problems:
+        error("Not merging: " + "; ".join(problems))
+        return 1
+    msg = clean(sys.stdin.read())
+    if args.method != "rebase" and (problem := validate(msg)):
+        error(f"Invalid subject: {problem}. Nothing was merged.")
+        return 1
+    subject = ["--subject", msg.splitlines()[0]] if args.method != "rebase" else []
+    # --match-head-commit: refuse if someone pushed after these checks ran
+    gh("pr", "merge", str(pr["number"]), f"--{args.method}", *subject,
+       "--delete-branch", "--match-head-commit", pr["headRefOid"])
+    if current_branch() == pr["baseRefName"]:
+        git("pull", "--ff-only", check=False)
+    ok(f"Merged #{pr['number']} into {pr['baseRefName']}.")
+    return 0
+
+
+CONFLICT_MARKER = re.compile(r"^(<{7} |={7}$|>{7} )", re.M)
+CONFLICT_KINDS = {"UU": "both modified", "AA": "both added",
+                  "DU": "deleted by us", "UD": "deleted by them",
+                  "AU": "added by us", "UA": "added by them",
+                  "DD": "deleted by both"}
+
+
+def git_op() -> tuple[str, str] | None:
+    """(operation, ref of the incoming change) while one is stopped."""
+    if git_path("rebase-merge").exists() or git_path("rebase-apply").exists():
+        return "rebase", "REBASE_HEAD"
+    for op, ref in (("merge", "MERGE_HEAD"), ("cherry-pick", "CHERRY_PICK_HEAD"),
+                    ("revert", "REVERT_HEAD")):
+        if git_path(ref).exists():
+            return op, ref
+    return None
+
+
+def conflict_context() -> dict:
+    root = Path(git("rev-parse", "--show-toplevel").strip())
+    files = [f for f in git("diff", "--name-only", "--diff-filter=U",
+                            "-z").split("\0") if f]  # root-relative paths
+    codes = {e[3:]: e[:2] for e in
+             git("status", "--porcelain=v1", "-z").split("\0") if len(e) > 3}
+    op = git_op()
+
+    def markers(f: str) -> int:
+        p = root / f
+        return len(CONFLICT_MARKER.findall(p.read_text(errors="ignore"))) \
+            if p.is_file() else 0
+
+    ctx = {
+        "operation": op[0] if op else None,
+        "incoming_ref": op[1] if op else None,
+        "incoming": git("log", "-1", "--format=%h %s", op[1], check=False).strip()
+        if op else None,
+        "branch": current_branch(),
+        "root": root.as_posix(),
+        "files": [{"path": f, "kind": CONFLICT_KINDS.get(codes.get(f, ""), "conflict"),
+                   "markers": markers(f), "lock_file": is_noise(f)} for f in files],
+    }
+    if op and op[0] == "rebase":
+        ctx["note"] = ("During a rebase the sides are swapped: 'ours' (:2) is the "
+                       "branch being rebased onto, 'theirs' (:3) is the user's "
+                       "commit being replayed.")
+    return ctx
+
+
+def cmd_conflicts(args) -> int:
+    ctx = conflict_context()
+    if not args.finish:
+        print(json.dumps(ctx, indent=2, ensure_ascii=False))
+        return 0
+    if left := [f["path"] for f in ctx["files"] if f["markers"]]:
+        error("Conflict markers are still in: " + ", ".join(left))
+        return 1
+    if ctx["files"]:
+        git("-C", ctx["root"], "add", "-A", "--", *[f["path"] for f in ctx["files"]])
+    if not ctx["operation"]:
+        ok("Resolved files are staged.")
+        return 0
+    op = ctx["operation"]
+    r = subprocess.run(["git", "-c", "core.editor=true", op, "--continue"],
+                       capture_output=True, text=True)
+    if git_op() and conflict_context()["files"]:
+        warn(f"The {op} stopped on the next conflicts. Run `conflicts` again.")
+        return 0
+    if r.returncode != 0:
+        error((r.stderr or r.stdout).strip() or f"git {op} --continue failed")
+        return 1
+    ok(f"{op} finished: {git('log', '-1', '--format=%h %s').strip()}")
+    return 0
+
+
 GIT_CMD = r"(?:^|[;&|(]\s*|\s)git\s+(?:-C\s+\S+\s+)?"
 QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
 LOSES_WORK = ("It permanently throws away uncommitted work. Ask the user first; "
@@ -619,7 +875,9 @@ def guard_check(part: str, cmd: str) -> str | None:
         or (sub("clean") and has_flag(flags, "f", "force")
             and not has_flag(flags, "n", "dry-run"))
         or (sub("checkout") and (re.search(r"\s(--|\.)(?=\s|$)", flags)
-                                 or has_flag(flags, "f", "force")))
+                                 or has_flag(flags, "f", "force"))
+            # taking one side of a conflict is how conflicts get resolved
+            and not re.search(r"\s--(ours|theirs)\b", flags))
         or (sub("switch") and (has_flag(flags, "f", "force")
                                or "--discard-changes" in flags.split()))
         or (sub("restore") and not (has_flag(flags, "S", "staged")
@@ -675,6 +933,27 @@ def main() -> int:
 
     x = sub.add_parser("context", help="print staged-change context as JSON")
     x.set_defaults(func=cmd_context)
+
+    v = sub.add_parser("review", help="print branch-review context as JSON")
+    v.add_argument("base", nargs="?", help="branch to compare with (default: main)")
+    v.set_defaults(func=cmd_review)
+
+    p = sub.add_parser("pr-comment", help="post a review (JSON on stdin) to the PR")
+    p.add_argument("pr", nargs="?", help="PR number (default: this branch's PR)")
+    p.add_argument("--dry-run", action="store_true", help="print, don't post")
+    p.set_defaults(func=cmd_pr_comment)
+
+    m = sub.add_parser("pr-merge", help="check a PR; with --stdin, merge it")
+    m.add_argument("pr", nargs="?", help="PR number (default: this branch's PR)")
+    m.add_argument("--stdin", action="store_true",
+                   help="read the commit subject from stdin and merge")
+    m.add_argument("--method", choices=["squash", "merge", "rebase"], default="squash")
+    m.set_defaults(func=cmd_pr_merge)
+
+    k = sub.add_parser("conflicts", help="list conflicted files as JSON")
+    k.add_argument("--finish", action="store_true",
+                   help="check no markers remain, stage, and continue")
+    k.set_defaults(func=cmd_conflicts)
 
     g = sub.add_parser("guard", help=argparse.SUPPRESS)
     g.set_defaults(func=cmd_guard)

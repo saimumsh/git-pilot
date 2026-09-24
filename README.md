@@ -8,6 +8,21 @@ every exact step and the safety checks. No API key is needed.
   - `/gitpilot:commit --all` stages tracked changes first
   - `/gitpilot:commit --yes` skips the approval step
   - `/gitpilot:commit mention it fixes #42` passes a hint
+- `/gitpilot:review` — review this branch's commits before merging: bugs,
+  security, missing tests, secrets. Verdict first, then `file:line` findings
+  - `/gitpilot:review develop` compares with `develop` instead of `main`
+  - `/gitpilot:review focus on error handling` narrows the review
+  - `/gitpilot:review --comment` also posts the findings as inline comments
+    on the branch's GitHub PR, after you approve (needs `gh`, and the branch
+    pushed)
+- `/gitpilot:merge` — merge this branch's PR after checking it is ready
+  (checks passed, no conflicts, not a draft, no changes requested, no
+  secrets). Squash by default, deletes the remote branch, pulls `main`
+  - `/gitpilot:merge 12 --method rebase` picks the PR and method
+  - on conflicts it offers to merge `main` into your branch locally
+- `/gitpilot:resolve` — resolve merge/rebase/cherry-pick conflicts: Claude
+  combines both sides, asks when intent is unclear, and gitpilot refuses to
+  continue while any conflict marker is left
 - `/gitpilot:undo` — undo the last unpushed commit, keeping changes staged
   (refuses merge commits and commits found on any remote branch)
 
@@ -23,7 +38,8 @@ Whenever Claude runs a Bash command, gitpilot checks it first and blocks:
 - `git stash drop` / `git stash clear`
 - `git reset --hard`, `git clean -f`, `git checkout -- <path>`,
   `git restore <path>`, and `git switch -f` / `--discard-changes` while there
-  are uncommitted changes
+  are uncommitted changes (`git checkout --ours/--theirs` stays allowed for
+  resolving conflicts)
 
 `git -C <dir>` is checked against `<dir>`. The guard never blocks on its own
 errors, so a bug can't lock you out of git.
@@ -35,7 +51,8 @@ Anthropic API: `pip install anthropic`, set `ANTHROPIC_API_KEY`):
 - `gitpilot.py hook install` — fill the message on every plain `git commit`
 
 ## Requirements
-Python 3.10+ and Git.
+Python 3.10+ and Git. `review --comment` and `merge` also need the GitHub CLI
+(`gh`, logged in with `gh auth login`).
 
 ## Tests
 `python3 scripts/test_gitpilot.py`
