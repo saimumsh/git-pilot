@@ -1,0 +1,5 @@
+{
+  "name": "gitpilot",
+  "version": "0.1.0",
+  "description": "Safe Git helpers: Conventional Commit messages, safe undo, and a guard that blocks secret commits and destructive git commands"
+}
